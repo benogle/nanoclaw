@@ -277,6 +277,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
+  // React to the last message so the user knows we're on it
+  const lastMsg = missedMessages[missedMessages.length - 1];
+  channel
+    .addReaction?.(chatJid, lastMsg.id, 'eyes')
+    ?.catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to add reaction'),
+    );
+
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -500,6 +508,13 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
+            // React to the last message so the user knows we're on it
+            const lastPiped = messagesToSend[messagesToSend.length - 1];
+            channel
+              .addReaction?.(chatJid, lastPiped.id, 'eyes')
+              ?.catch((err) =>
+                logger.warn({ chatJid, err }, 'Failed to add reaction'),
+              );
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
