@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CONTAINER_ENV_VARS,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -16,6 +17,7 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -232,6 +234,17 @@ async function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Inject whitelisted env vars into the container
+  if (CONTAINER_ENV_VARS.length > 0) {
+    const envValues = readEnvFile(CONTAINER_ENV_VARS);
+    for (const varName of CONTAINER_ENV_VARS) {
+      const value = process.env[varName] ?? envValues[varName];
+      if (value != null) {
+        args.push('-e', `${varName}=${value}`);
+      }
+    }
+  }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.

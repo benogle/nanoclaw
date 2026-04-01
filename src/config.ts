@@ -8,6 +8,7 @@ import { isValidTimezone } from './timezone.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CONTAINER_ENV_VARS',
   'ONECLI_URL',
   'TZ',
 ]);
@@ -95,3 +96,14 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+// Comma-separated list of .env variable names to inject into agent containers.
+// Prefer OneCLI for API credentials where possible (avoids secrets in container env).
+// Use this for tokens that tools require as env vars: GH_TOKEN, NOTION_TOKEN, etc.
+// Example: CONTAINER_ENV_VARS=GH_TOKEN,NOTION_TOKEN
+export const CONTAINER_ENV_VARS: string[] = (
+  process.env.CONTAINER_ENV_VARS ?? envConfig.CONTAINER_ENV_VARS ?? ''
+)
+  .split(',')
+  .map((v: string) => v.trim())
+  .filter(Boolean);
