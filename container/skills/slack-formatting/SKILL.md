@@ -84,6 +84,17 @@ _March 21, 2026_
 :white_check_mark: All tests passing | <https://ci.example.com/builds/123|View Build>
 ```
 
+## Threading
+
+Responses default to threading (replying in the same thread as the triggering message).
+
+To send a reply at the *channel level* instead (not in a thread), include `<no-thread>` anywhere in your response — it will be stripped before posting. Use this sparingly, e.g. for announcements that should be visible to the whole channel rather than buried in a thread.
+
+```
+<no-thread>
+This reply goes to the channel, not a thread.
+```
+
 ## Quick rules
 
 1. Use `*bold*` not `**bold**`
@@ -92,3 +103,4 @@ _March 21, 2026_
 4. Use `:emoji:` shortcodes
 5. Quote blocks with `>`
 6. Skip headings — use bold text instead
+7. Respond in threads by default; use `<no-thread>` only when channel-level visibility matters
