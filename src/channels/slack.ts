@@ -22,6 +22,103 @@ const MAX_MESSAGE_LENGTH = 4000;
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
 
+/**
+ * Thread-aware JID encoding for Slack.
+ *
+ * Format:  slack:{channelId}/{threadTs}
+ *
+ * - The base JID (`slack:{channelId}`) is used for group registration/lookup.
+ * - The thread JID includes the Slack thread timestamp so replies land in the
+ *   correct thread.  If the incoming message is already in a thread we use its
+ *   `thread_ts`; otherwise we use `msg.ts`, which starts a new thread anchored
+ *   to that message.
+ *
+ * Agent opt-out: include `<no-thread>` anywhere in the response text to send
+ * the reply at channel level instead of in a thread.  The tag is stripped
+ * before the message is posted.
+ */
+
+/** Build the base channel JID (no thread suffix). */
+function slackChannelJid(channelId: string): string {
+  return `slack:${channelId}`;
+}
+
+/** Build the full thread-aware JID. */
+function slackThreadJid(channelId: string, threadTs: string): string {
+  return `slack:${channelId}/${threadTs}`;
+}
+
+/**
+ * Parse a Slack JID (with or without thread suffix) into its parts.
+ * Returns `{ channelId, threadTs }` where `threadTs` may be undefined.
+ */
+function parseSlackJid(jid: string): { channelId: string; threadTs: string | undefined } {
+  const rest = jid.replace(/^slack:/, '');
+  const slashIdx = rest.indexOf('/');
+  if (slashIdx === -1) {
+    return { channelId: rest, threadTs: undefined };
+  }
+  return { channelId: rest.slice(0, slashIdx), threadTs: rest.slice(slashIdx + 1) };
+}
+
+/**
+ * Convert GitHub-flavored Markdown to Slack mrkdwn format.
+ *
+ * Key differences handled:
+ *   **bold**        → *bold*
+ *   [text](url)     → <url|text>
+ *   ## Heading      → *Heading*
+ *   - bullet item   → • bullet item
+ *
+ * Fenced code blocks and inline code are left untouched.
+ */
+export function markdownToMrkdwn(text: string): string {
+  const placeholders: string[] = [];
+
+  // Protect fenced code blocks (``` ... ```) before any other substitutions
+  let result = text.replace(/```[\s\S]*?```/g, (match) => {
+    placeholders.push(match);
+    return `\x00P${placeholders.length - 1}\x00`;
+  });
+
+  // Protect inline code (` ... `)
+  result = result.replace(/`[^`\n]+`/g, (match) => {
+    placeholders.push(match);
+    return `\x00P${placeholders.length - 1}\x00`;
+  });
+
+  // Headings: ## Heading → *Heading*
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
+
+  // Bold: **text** → *text*
+  result = result.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
+
+  // Links: [text](url) → <url|text>
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');
+
+  // Unordered bullets: lines starting with "- " or "* " → "• "
+  result = result.replace(/^[ \t]*[-*][ \t]+/gm, '• ');
+
+  // Restore protected code blocks
+  result = result.replace(
+    /\x00P(\d+)\x00/g,
+    (_, i) => placeholders[parseInt(i, 10)],
+  );
+
+  return result;
+}
+
+/**
+ * Format outbound text for Slack: strip the `<no-thread>` directive and
+ * convert Markdown to mrkdwn.  Returns the formatted text and whether the
+ * agent opted out of threading.
+ */
+function formatForSlack(text: string): { formatted: string; noThread: boolean } {
+  const noThread = text.includes('<no-thread>');
+  const cleaned = text.replace(/<no-thread>\s*/g, '');
+  return { formatted: markdownToMrkdwn(cleaned), noThread };
+}
+
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -79,20 +176,19 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
-
-      const jid = `slack:${msg.channel}`;
+      // Base JID (channel only) is used for group registration/lookup so that
+      // groups registered as "slack:CHANNEL_ID" continue to match regardless
+      // of which thread a message arrived in.
+      const baseJid = slackChannelJid(msg.channel);
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
 
-      // Always report metadata for group discovery
-      this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
+      // Always report metadata using the base JID for group discovery
+      this.opts.onChatMetadata(baseJid, timestamp, undefined, 'slack', isGroup);
 
       // Only deliver full messages for registered groups
       const groups = this.opts.registeredGroups();
-      if (!groups[jid]) return;
+      if (!groups[baseJid]) return;
 
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
@@ -120,9 +216,17 @@ export class SlackChannel implements Channel {
         }
       }
 
-      this.opts.onMessage(jid, {
+      // Thread-aware JID: use thread_ts if the message is already in a thread,
+      // otherwise use msg.ts to anchor a new thread on this message.
+      // The agent's response will be routed back to this JID, landing in the
+      // correct thread.  Bot messages use the base JID so they don't start
+      // new threads for every outgoing chunk.
+      const threadTs = (msg as { thread_ts?: string }).thread_ts ?? msg.ts;
+      const messageJid = isBotMessage ? baseJid : slackThreadJid(msg.channel, threadTs);
+
+      this.opts.onMessage(messageJid, {
         id: msg.ts,
-        chat_jid: jid,
+        chat_jid: messageJid,
         sender: msg.user || msg.bot_id || '',
         sender_name: senderName,
         content,
@@ -157,7 +261,13 @@ export class SlackChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    const channelId = jid.replace(/^slack:/, '');
+    const { channelId, threadTs } = parseSlackJid(jid);
+    const { formatted, noThread } = formatForSlack(text);
+
+    const postBase = {
+      channel: channelId,
+      ...(threadTs && !noThread ? { thread_ts: threadTs } : {}),
+    };
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -170,17 +280,17 @@ export class SlackChannel implements Channel {
 
     try {
       // Slack limits messages to ~4000 characters; split if needed
-      if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+      if (formatted.length <= MAX_MESSAGE_LENGTH) {
+        await this.app.client.chat.postMessage({ ...postBase, text: formatted });
       } else {
-        for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
+        for (let i = 0; i < formatted.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
-            channel: channelId,
-            text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            ...postBase,
+            text: formatted.slice(i, i + MAX_MESSAGE_LENGTH),
           });
         }
       }
-      logger.info({ jid, length: text.length }, 'Slack message sent');
+      logger.info({ jid, length: formatted.length }, 'Slack message sent');
     } catch (err) {
       this.outgoingQueue.push({ jid, text });
       logger.warn(
@@ -215,7 +325,7 @@ export class SlackChannel implements Channel {
     messageId: string,
     emoji: string,
   ): Promise<void> {
-    const channelId = jid.replace(/^slack:/, '');
+    const { channelId } = parseSlackJid(jid);
     try {
       await this.app.client.reactions.add({
         channel: channelId,
@@ -297,13 +407,15 @@ export class SlackChannel implements Channel {
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
-        const channelId = item.jid.replace(/^slack:/, '');
+        const { channelId, threadTs } = parseSlackJid(item.jid);
+        const { formatted, noThread } = formatForSlack(item.text);
         await this.app.client.chat.postMessage({
           channel: channelId,
-          text: item.text,
+          ...(threadTs && !noThread ? { thread_ts: threadTs } : {}),
+          text: formatted,
         });
         logger.info(
-          { jid: item.jid, length: item.text.length },
+          { jid: item.jid, length: formatted.length },
           'Queued Slack message sent',
         );
       }
