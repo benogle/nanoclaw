@@ -237,6 +237,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
+  // Determine reply JID from the most recent message. For thread-aware
+  // channels (Slack) the message's chat_jid includes the thread suffix, so
+  // replies land in the correct thread. Falls back to the base group JID.
+  const lastMsg = missedMessages[missedMessages.length - 1];
+  const replyJid = lastMsg.chat_jid !== chatJid ? lastMsg.chat_jid : chatJid;
+
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = getTriggerPattern(group.trigger);
@@ -278,12 +284,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   // React to the last message so the user knows we're on it
-  const lastMsg = missedMessages[missedMessages.length - 1];
   channel
-    .addReaction?.(chatJid, lastMsg.id, 'eyes')
+    .addReaction?.(replyJid, lastMsg.id, 'eyes')
     ?.catch((err) => logger.warn({ chatJid, err }, 'Failed to add reaction'));
 
-  await channel.setTyping?.(chatJid, true);
+  await channel.setTyping?.(replyJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -298,7 +303,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await channel.sendMessage(replyJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -314,7 +319,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  await channel.setTyping?.(replyJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -447,14 +452,22 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
+        // Deduplicate by base group JID, resolving thread JIDs.
+        // Thread JIDs (e.g. "slack:CH123/threadTs") are matched to the
+        // registered base JID ("slack:CH123") so the message loop picks them up.
         const messagesByGroup = new Map<string, NewMessage[]>();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
+          // Find the registered base JID that this message's chat_jid belongs to
+          const baseJid = registeredGroups[msg.chat_jid]
+            ? msg.chat_jid
+            : Object.keys(registeredGroups).find((jid) => msg.chat_jid.startsWith(jid));
+          if (!baseJid) continue;
+
+          const existing = messagesByGroup.get(baseJid);
           if (existing) {
             existing.push(msg);
           } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
+            messagesByGroup.set(baseJid, [msg]);
           }
         }
 
