@@ -322,7 +322,11 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
-  const placeholders = jids.map(() => '?').join(',');
+  // Match exact JIDs and thread sub-JIDs (e.g. "slack:CH123" also matches
+  // "slack:CH123/thread_ts").  Build an OR of LIKE patterns so thread messages
+  // stored under sub-JIDs are picked up by the message loop.
+  const likeClauses = jids.map(() => 'chat_jid LIKE ?').join(' OR ');
+  const likeParams = jids.map((j) => `${j}%`);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
@@ -330,7 +334,7 @@ export function getNewMessages(
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE timestamp > ? AND chat_jid IN (${placeholders})
+      WHERE timestamp > ? AND (${likeClauses})
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
@@ -340,7 +344,7 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(lastTimestamp, ...likeParams, `${botPrefix}:%`, limit) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -359,11 +363,13 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
+  // Match the exact JID and any thread sub-JIDs (e.g. "slack:CH123" also
+  // matches "slack:CH123/thread_ts") so thread context is included.
   const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE chat_jid = ? AND timestamp > ?
+      WHERE chat_jid LIKE ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
@@ -372,7 +378,7 @@ export function getMessagesSince(
   `;
   return db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(`${chatJid}%`, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 export function getLastBotMessageTimestamp(
