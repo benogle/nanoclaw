@@ -115,6 +115,15 @@ function loadState(): void {
 }
 
 /**
+ * Resolve a (possibly thread-scoped) JID to its registered base group JID.
+ * Returns undefined if no registered group matches.
+ */
+function resolveBaseJid(jid: string): string | undefined {
+  if (registeredGroups[jid]) return jid;
+  return Object.keys(registeredGroups).find((baseJid) => jid.startsWith(baseJid));
+}
+
+/**
  * Return the message cursor for a group, recovering from the last bot reply
  * if lastAgentTimestamp is missing (new group, corrupted state, restart).
  */
@@ -213,11 +222,14 @@ export function _setRegisteredGroups(
 }
 
 /**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
+ * Process all pending messages for a thread (or base group).
+ * Called by the GroupQueue — chatJid may be a thread JID like
+ * "slack:CH123/threadTs" or a base JID like "slack:CH123".
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  // Resolve thread JID → base group for config lookup
+  const baseJid = resolveBaseJid(chatJid) ?? chatJid;
+  const group = registeredGroups[baseJid];
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
@@ -228,6 +240,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
+  // Query messages for this specific thread/channel JID
   const missedMessages = getMessagesSince(
     chatJid,
     getOrRecoverCursor(chatJid),
@@ -237,12 +250,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // Determine reply JID from the most recent message. For thread-aware
-  // channels (Slack) the message's chat_jid includes the thread suffix, so
-  // replies land in the correct thread. Falls back to the base group JID.
-  const lastMsg = missedMessages[missedMessages.length - 1];
-  const replyJid = lastMsg.chat_jid !== chatJid ? lastMsg.chat_jid : chatJid;
-
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = getTriggerPattern(group.trigger);
@@ -250,7 +257,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const hasTrigger = missedMessages.some(
       (m) =>
         triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+        (m.is_from_me || isTriggerAllowed(baseJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
   }
@@ -284,11 +291,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   // React to the last message so the user knows we're on it
+  const lastMsg = missedMessages[missedMessages.length - 1];
   channel
-    .addReaction?.(replyJid, lastMsg.id, 'eyes')
+    .addReaction?.(chatJid, lastMsg.id, 'eyes')
     ?.catch((err) => logger.warn({ chatJid, err }, 'Failed to add reaction'));
 
-  await channel.setTyping?.(replyJid, true);
+  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -303,7 +311,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(replyJid, text);
+        await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -319,7 +327,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(replyJid, false);
+  await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -452,41 +460,34 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by base group JID, resolving thread JIDs.
-        // Thread JIDs (e.g. "slack:CH123/threadTs") are matched to the
-        // registered base JID ("slack:CH123") so the message loop picks them up.
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        // Group messages by their actual chat_jid (thread JID). Each thread
+        // gets its own queue entry so threads run as parallel conversations.
+        const messagesByThread = new Map<string, NewMessage[]>();
         for (const msg of messages) {
-          // Find the registered base JID that this message's chat_jid belongs to
-          const baseJid = registeredGroups[msg.chat_jid]
-            ? msg.chat_jid
-            : Object.keys(registeredGroups).find((jid) => msg.chat_jid.startsWith(jid));
-          if (!baseJid) continue;
+          if (!resolveBaseJid(msg.chat_jid)) continue;
 
-          const existing = messagesByGroup.get(baseJid);
+          const existing = messagesByThread.get(msg.chat_jid);
           if (existing) {
             existing.push(msg);
           } else {
-            messagesByGroup.set(baseJid, [msg]);
+            messagesByThread.set(msg.chat_jid, [msg]);
           }
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+        for (const [threadJid, groupMessages] of messagesByThread) {
+          const baseJid = resolveBaseJid(threadJid)!;
+          const group = registeredGroups[baseJid];
           if (!group) continue;
 
-          const channel = findChannel(channels, chatJid);
+          const channel = findChannel(channels, threadJid);
           if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+            logger.warn({ threadJid }, 'No channel owns JID, skipping messages');
             continue;
           }
 
           const isMainGroup = group.isMain === true;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
 
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
           if (needsTrigger) {
             const triggerPattern = getTriggerPattern(group.trigger);
             const allowlistCfg = loadSenderAllowlist();
@@ -494,16 +495,15 @@ async function startMessageLoop(): Promise<void> {
               (m) =>
                 triggerPattern.test(m.content.trim()) &&
                 (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+                  isTriggerAllowed(baseJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
+          // Pull all messages since lastAgentTimestamp for this specific thread.
           const allPending = getMessagesSince(
-            chatJid,
-            getOrRecoverCursor(chatJid),
+            threadJid,
+            getOrRecoverCursor(threadJid),
             ASSISTANT_NAME,
             MAX_MESSAGES_PER_PROMPT,
           );
@@ -511,30 +511,28 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          if (queue.sendMessage(threadJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { threadJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
+            lastAgentTimestamp[threadJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // React to the last message so the user knows we're on it
             const lastPiped = messagesToSend[messagesToSend.length - 1];
             channel
-              .addReaction?.(chatJid, lastPiped.id, 'eyes')
+              .addReaction?.(threadJid, lastPiped.id, 'eyes')
               ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to add reaction'),
+                logger.warn({ threadJid, err }, 'Failed to add reaction'),
               );
-            // Show typing indicator while the container processes the piped message
             channel
-              .setTyping?.(chatJid, true)
+              .setTyping?.(threadJid, true)
               ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+                logger.warn({ threadJid, err }, 'Failed to set typing indicator'),
               );
           } else {
             // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            queue.enqueueMessageCheck(threadJid);
           }
         }
       }
@@ -651,11 +649,12 @@ async function main(): Promise<void> {
       }
 
       // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+      const allowlistBaseJid = resolveBaseJid(chatJid);
+      if (!msg.is_from_me && !msg.is_bot_message && allowlistBaseJid) {
         const cfg = loadSenderAllowlist();
         if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
+          shouldDropMessage(allowlistBaseJid, cfg) &&
+          !isSenderAllowed(allowlistBaseJid, msg.sender, cfg)
         ) {
           if (cfg.logDenied) {
             logger.debug(

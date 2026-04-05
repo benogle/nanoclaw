@@ -363,13 +363,13 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
-  // Match the exact JID and any thread sub-JIDs (e.g. "slack:CH123" also
-  // matches "slack:CH123/thread_ts") so thread context is included.
+  // Use exact match for thread-level isolation. Each thread JID
+  // (e.g. "slack:CH123/threadTs") gets its own conversation context.
   const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE chat_jid LIKE ? AND timestamp > ?
+      WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
@@ -378,19 +378,21 @@ export function getMessagesSince(
   `;
   return db
     .prepare(sql)
-    .all(`${chatJid}%`, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 export function getLastBotMessageTimestamp(
   chatJid: string,
   botPrefix: string,
 ): string | undefined {
+  // Match both the exact JID and any thread sub-JIDs so cursor recovery
+  // works for both base channel JIDs and thread JIDs.
   const row = db
     .prepare(
       `SELECT MAX(timestamp) as ts FROM messages
-       WHERE chat_jid = ? AND (is_bot_message = 1 OR content LIKE ?)`,
+       WHERE chat_jid LIKE ? AND (is_bot_message = 1 OR content LIKE ?)`,
     )
-    .get(chatJid, `${botPrefix}:%`) as { ts: string | null } | undefined;
+    .get(`${chatJid}%`, `${botPrefix}:%`) as { ts: string | null } | undefined;
   return row?.ts ?? undefined;
 }
 
