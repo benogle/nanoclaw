@@ -224,6 +224,12 @@ export class SlackChannel implements Channel {
       const threadTs = (msg as { thread_ts?: string }).thread_ts ?? msg.ts;
       const messageJid = isBotMessage ? baseJid : slackThreadJid(msg.channel, threadTs);
 
+      // Ensure the thread JID exists in the chats table so the foreign key
+      // constraint on messages.chat_jid is satisfied.
+      if (messageJid !== baseJid) {
+        this.opts.onChatMetadata(messageJid, timestamp, undefined, 'slack', isGroup);
+      }
+
       this.opts.onMessage(messageJid, {
         id: msg.ts,
         chat_jid: messageJid,
